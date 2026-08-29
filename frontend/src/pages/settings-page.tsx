@@ -12,6 +12,13 @@ import { apiFetch, getSecurityHeaders } from '@/lib/api';
 import { getUser, logout, setUser, type User } from '@/lib/auth';
 import { validateText } from '@/lib/validators';
 
+const QQ_CHAT_URL = 'https://qm.qq.com/q/Xz1Vy4UgQE';
+
+function copyCodeAndOpenQq(code: string) {
+	navigator.clipboard?.writeText(code).catch(() => {});
+	window.location.href = QQ_CHAT_URL;
+}
+
 export function SettingsPage() {
 	const [user, setUserState] = React.useState<User | null>(() => getUser());
 	const [loading, setLoading] = React.useState(false);
@@ -384,8 +391,8 @@ export function SettingsPage() {
 									<div className="space-y-2 rounded-md border p-4 text-center">
 										<div className="font-mono text-3xl font-semibold tracking-normal">{bindQqCode}</div>
 										<div className="text-sm text-muted-foreground">{bindQqText || '等待 QQ 私聊验证...'}</div>
-										<Button type="button" variant="outline" size="sm" onClick={() => navigator.clipboard?.writeText(bindQqCode).catch(() => {})}>
-											复制验证码
+										<Button type="button" variant="outline" size="sm" onClick={() => copyCodeAndOpenQq(bindQqCode)}>
+											复制并跳转到 QQ
 										</Button>
 									</div>
 								) : (

@@ -20,6 +20,13 @@ type QqBotStatus = {
 	version?: string;
 };
 
+const QQ_CHAT_URL = 'https://qm.qq.com/q/Xz1Vy4UgQE';
+
+function copyCodeAndOpenQq(code: string) {
+	navigator.clipboard?.writeText(code).catch(() => {});
+	window.location.href = QQ_CHAT_URL;
+}
+
 export function RegisterPage() {
 	const { config } = useConfig();
 	const [registerMode, setRegisterMode] = React.useState<RegisterMode>('email');
@@ -333,8 +340,8 @@ export function RegisterPage() {
 										<div className="space-y-2 text-center">
 											<div className="font-mono text-3xl font-semibold tracking-normal">{qqCode}</div>
 											<div className="text-sm text-muted-foreground">{qqPollText || '等待 QQ 私聊验证...'}</div>
-											<Button type="button" variant="outline" size="sm" onClick={() => navigator.clipboard?.writeText(qqCode).catch(() => {})}>
-												复制验证码
+											<Button type="button" variant="outline" size="sm" onClick={() => copyCodeAndOpenQq(qqCode)}>
+												复制并跳转到 QQ
 											</Button>
 										</div>
 									) : null}

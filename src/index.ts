@@ -5,12 +5,24 @@ import { uploadImage, deleteImage, listAllKeys, getPublicUrl, getKeyFromUrl, S3E
 import * as OTPAuth from 'otpauth';
 import { Security } from './security';
 import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
+import {
+	QQ_CODE_TTL_SECONDS,
+	generateQqCode,
+	isUsablePasswordHash,
+	makeQqPlaceholderEmail,
+	normalizeQqCode,
+	normalizeQqId,
+	safeQqAvatarUrl,
+	toPublicUser,
+} from './qq-auth';
 
 interface AppEnv extends Env {
     cforum_db: D1Database;
     BASE_URL?: string;
     JWT_SECRET?: string;
     GOOGLE_CLIENT_ID?: string;
+    QQ_BOT_AUTH_URL?: string;
+    CFORUM_AUTH_TOKEN?: string;
 }
 
 interface DBUser {
@@ -30,6 +42,9 @@ interface DBUser {
     verification_token?: string;
     email_change_token?: string;
     google_sub?: string | null;
+    qq_id?: string | null;
+    qq_nickname?: string | null;
+    qq_bound_at?: string | null;
 }
 
 interface PostAuthorInfo {
@@ -140,6 +155,35 @@ async function makeUniqueGoogleUsername(db: D1Database, name: string | undefined
 	return `google_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
 }
 
+async function makeUniqueQqUsername(db: D1Database, qqId: string, nickname?: string | null): Promise<string> {
+	let base = cleanUsernameCandidate(nickname || '');
+	if (base.length > 20) base = base.slice(0, 20).trim();
+	if (isVisuallyEmpty(base) || hasRestrictedKeywords(base)) {
+		base = `QQ${qqId.slice(-6)}`;
+	}
+
+	const suffix = qqId.slice(-4);
+	const candidates = [
+		base,
+		`${base.slice(0, Math.max(1, 19 - suffix.length))}_${suffix}`,
+		`qq_${qqId.slice(-10)}`,
+	];
+
+	for (const candidate of candidates) {
+		const existing = await db.prepare('SELECT id FROM users WHERE username = ?').bind(candidate).first<{ id: number }>();
+		if (!existing) return candidate;
+	}
+
+	for (let i = 0; i < 10; i++) {
+		const randomSuffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+		const candidate = `qq_${qqId.slice(-6)}_${randomSuffix}`.slice(0, 20);
+		const existing = await db.prepare('SELECT id FROM users WHERE username = ?').bind(candidate).first<{ id: number }>();
+		if (!existing) return candidate;
+	}
+
+	return `qq_${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+}
+
 async function verifyTotpForUser(user: DBUser, totpCode?: string): Promise<'ok' | 'required' | 'not_configured' | 'invalid'> {
 	if (!user.totp_enabled) return 'ok';
 	if (!totpCode) return 'required';
@@ -211,7 +255,7 @@ export default {
 		const corsHeaders = {
 			'Access-Control-Allow-Origin': '*',
 			'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS, DELETE, PUT',
-			'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Timestamp, X-Nonce',
+			'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Timestamp, X-Nonce, X-CForum-Auth',
 		};
 
 		// Handle OPTIONS (CORS preflight)
@@ -270,10 +314,26 @@ export default {
   pending_email TEXT,
   email_change_token TEXT,
   google_sub TEXT,
+  qq_id TEXT,
+  qq_nickname TEXT,
+  qq_bound_at TIMESTAMP,
   avatar_url TEXT,
   nickname TEXT,
   email_notifications INTEGER DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);`,
+				`CREATE TABLE IF NOT EXISTS qq_login_challenges (
+  session_id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  purpose TEXT NOT NULL CHECK (purpose IN ('login', 'bind')),
+  requester_user_id INTEGER,
+  qq_id TEXT,
+  qq_nickname TEXT,
+  avatar_url TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  verified_at INTEGER
 );`,
 				`CREATE TABLE IF NOT EXISTS categories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -338,6 +398,9 @@ export default {
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );`,
 				`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_qq_id ON users(qq_id) WHERE qq_id IS NOT NULL;`,
+				`CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_code ON qq_login_challenges(code);`,
+				`CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_expires ON qq_login_challenges(expires_at);`,
 				`INSERT OR IGNORE INTO settings (key, value) VALUES ('turnstile_enabled', '0');`,
 				`INSERT OR IGNORE INTO users (email, username, password, role, verified, nickname) VALUES 
 ('admin@adysec.com', 'Admin', 'e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7', 'admin', 1, 'System Admin');`
@@ -375,6 +438,42 @@ export default {
 
 		await ensureGoogleAuthSchema();
 
+		const ensureQqAuthSchema = async () => {
+			try {
+				const columns = await env.cforum_db.prepare('PRAGMA table_info(users)').all();
+				const names = new Set((columns.results || []).map((column: any) => String(column.name)));
+				if (!names.has('qq_id')) {
+					await env.cforum_db.prepare('ALTER TABLE users ADD COLUMN qq_id TEXT').run();
+				}
+				if (!names.has('qq_nickname')) {
+					await env.cforum_db.prepare('ALTER TABLE users ADD COLUMN qq_nickname TEXT').run();
+				}
+				if (!names.has('qq_bound_at')) {
+					await env.cforum_db.prepare('ALTER TABLE users ADD COLUMN qq_bound_at TIMESTAMP').run();
+				}
+				await env.cforum_db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_qq_id ON users(qq_id) WHERE qq_id IS NOT NULL').run();
+				await env.cforum_db.prepare(`CREATE TABLE IF NOT EXISTS qq_login_challenges (
+  session_id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  purpose TEXT NOT NULL CHECK (purpose IN ('login', 'bind')),
+  requester_user_id INTEGER,
+  qq_id TEXT,
+  qq_nickname TEXT,
+  avatar_url TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  verified_at INTEGER
+)`).run();
+				await env.cforum_db.prepare('CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_code ON qq_login_challenges(code)').run();
+				await env.cforum_db.prepare('CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_expires ON qq_login_challenges(expires_at)').run();
+			} catch (e) {
+				console.error('Failed to ensure QQ auth schema', e);
+			}
+		};
+
+		await ensureQqAuthSchema();
+
 		let security: Security;
 		try {
 			security = new Security(env);
@@ -409,9 +508,74 @@ export default {
 			return jsonResponse({ error: errString }, 500);
 		};
 
+		const getQqBotStatus = async () => {
+			const botBase = String((env as any).QQ_BOT_AUTH_URL || '').trim().replace(/\/+$/, '');
+			const token = String((env as any).CFORUM_AUTH_TOKEN || '').trim();
+			if (!botBase || !token) {
+				return { configured: false, available: false, reason: 'QQ bot bridge is not configured' };
+			}
+
+			const controller = new AbortController();
+			const timeout = setTimeout(() => controller.abort(), 4000);
+			try {
+				const response = await fetch(`${botBase}/api/public/forum-qq/status`, {
+					method: 'GET',
+					headers: { Authorization: `Bearer ${token}` },
+					signal: controller.signal,
+				});
+				const data = await response.json().catch(() => ({})) as any;
+				if (!response.ok) {
+					return {
+						configured: true,
+						available: false,
+						reason: data?.reason || data?.detail || `Bot status HTTP ${response.status}`,
+					};
+				}
+				return {
+					configured: true,
+					available: !!data.available,
+					reason: data.reason || '',
+					bot_qq: data.bot_qq || '',
+					version: data.version || '',
+				};
+			} catch (e: any) {
+				return { configured: true, available: false, reason: String(e?.message || e || 'Bot status request failed') };
+			} finally {
+				clearTimeout(timeout);
+			}
+		};
+
+		const requireForumBridgeAuth = () => {
+			const expected = String((env as any).CFORUM_AUTH_TOKEN || '').trim();
+			if (!expected) {
+				throw new Error('QQ bridge token is not configured');
+			}
+			const bearer = request.headers.get('Authorization') || '';
+			const token = bearer.startsWith('Bearer ') ? bearer.slice(7).trim() : String(request.headers.get('X-CForum-Auth') || '').trim();
+			if (!token || token !== expected) {
+				throw new Error('Auth Unauthorized');
+			}
+		};
+
+		const createForumSession = async (user: DBUser, action: string, details: any) => {
+			const { token, jti, expiresAt } = await security.generateToken({
+				id: user.id,
+				role: user.role || 'user',
+				email: user.email,
+			});
+			await env.cforum_db.prepare('INSERT INTO sessions (jti, user_id, expires_at) VALUES (?, ?, ?)').bind(jti, user.id, expiresAt).run();
+			await security.logAudit(user.id, action, 'user', String(user.id), details, request);
+			return { token, user: toPublicUser(user) };
+		};
+
+		const cleanupExpiredQqChallenges = async () => {
+			await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE expires_at < ?').bind(Math.floor(Date.now() / 1000)).run();
+		};
+
 
         const publicPaths = [
             '/api/config', '/api/login', '/api/register', '/api/verify', '/api/auth/google',
+			'/api/auth/qq/status',
             '/api/auth/forgot-password', '/api/auth/reset-password', '/api/verify-email-change',
              // Static/Public GETs
             '/api/posts', '/api/categories', '/api/users' 
@@ -570,6 +734,233 @@ export default {
 
 		// --- AUTH ROUTES ---
 
+		// GET /api/auth/qq/status
+		if (url.pathname === '/api/auth/qq/status' && method === 'GET') {
+			try {
+				return jsonResponse(await getQqBotStatus());
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
+		// POST /api/auth/qq/request-code
+		if (url.pathname === '/api/auth/qq/request-code' && method === 'POST') {
+			try {
+				const body = await request.json() as any;
+				const ip = request.headers.get('CF-Connecting-IP') || '127.0.0.1';
+				if (!(await checkTurnstile(body, ip))) {
+					return jsonResponse({ error: 'Turnstile verification failed' }, 403);
+				}
+
+				const status = await getQqBotStatus();
+				if (!status.available) {
+					return jsonResponse({ error: status.reason || 'QQ bot is unavailable', status }, 503);
+				}
+
+				await cleanupExpiredQqChallenges();
+				const sessionId = crypto.randomUUID();
+				const code = generateQqCode();
+				const now = Math.floor(Date.now() / 1000);
+				await env.cforum_db.prepare(
+					'INSERT INTO qq_login_challenges (session_id, code, purpose, status, created_at, expires_at) VALUES (?, ?, "login", "pending", ?, ?)'
+				).bind(sessionId, code, now, now + QQ_CODE_TTL_SECONDS).run();
+
+				return jsonResponse({
+					session_id: sessionId,
+					code,
+					expires_in: QQ_CODE_TTL_SECONDS,
+					bot_qq: (status as any).bot_qq || '',
+					message: `请将验证码 ${code} 通过 QQ 私聊发送给机器人`,
+				});
+			} catch (e: any) {
+				if (String(e?.message || e).includes('UNIQUE constraint failed')) {
+					return jsonResponse({ error: '验证码生成冲突，请重试' }, 409);
+				}
+				return handleError(e);
+			}
+		}
+
+		// GET /api/auth/qq/check/:session_id
+		if (url.pathname.startsWith('/api/auth/qq/check/') && method === 'GET') {
+			try {
+				const sessionId = decodeURIComponent(url.pathname.split('/').pop() || '').trim();
+				if (!sessionId) return jsonResponse({ error: 'Missing session id' }, 400);
+
+				const challenge = await env.cforum_db
+					.prepare('SELECT * FROM qq_login_challenges WHERE session_id = ?')
+					.bind(sessionId)
+					.first<any>();
+				if (!challenge) return jsonResponse({ status: 'not_found' });
+
+				const now = Math.floor(Date.now() / 1000);
+				if (Number(challenge.expires_at) < now) {
+					await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE session_id = ?').bind(sessionId).run();
+					return jsonResponse({ status: 'expired' });
+				}
+				if (challenge.status !== 'verified') return jsonResponse({ status: challenge.status || 'pending' });
+
+				if (challenge.purpose === 'bind') {
+					await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE session_id = ?').bind(sessionId).run();
+					const user = await env.cforum_db.prepare('SELECT * FROM users WHERE id = ?').bind(challenge.requester_user_id).first<DBUser>();
+					return jsonResponse({ status: 'bound', user: user ? toPublicUser(user) : null });
+				}
+
+				const qqId = normalizeQqId(challenge.qq_id);
+				if (!qqId) return jsonResponse({ error: 'QQ verification missing user id' }, 400);
+
+				let user = await env.cforum_db.prepare('SELECT * FROM users WHERE qq_id = ?').bind(qqId).first<DBUser>();
+				let action = 'LOGIN_QQ';
+				if (!user) {
+					const nickname = cleanUsernameCandidate(String(challenge.qq_nickname || ''));
+					const username = await makeUniqueQqUsername(env.cforum_db, qqId, nickname);
+					const avatarUrl = safeQqAvatarUrl(qqId, challenge.avatar_url);
+					const email = makeQqPlaceholderEmail(qqId);
+					const passwordPlaceholder = `oauth:qq:${crypto.randomUUID()}`;
+					const inserted = await env.cforum_db.prepare(
+						'INSERT INTO users (email, username, password, role, verified, qq_id, qq_nickname, qq_bound_at, avatar_url) VALUES (?, ?, ?, "user", 1, ?, ?, CURRENT_TIMESTAMP, ?)'
+					).bind(email, username, passwordPlaceholder, qqId, nickname || null, avatarUrl).run();
+					if (!inserted.success) return jsonResponse({ error: 'Failed to create QQ account' }, 500);
+					user = await env.cforum_db.prepare('SELECT * FROM users WHERE qq_id = ?').bind(qqId).first<DBUser>();
+					action = 'REGISTER_QQ_LOGIN';
+				}
+				if (!user) return jsonResponse({ error: 'Failed to load QQ account' }, 500);
+				if (!user.verified) return jsonResponse({ error: 'Please verify your account first' }, 403);
+
+				await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE session_id = ?').bind(sessionId).run();
+				return jsonResponse(await createForumSession(user, action, { qq_id: qqId }));
+			} catch (e: any) {
+				if (String(e?.message || e).includes('UNIQUE constraint failed')) {
+					return jsonResponse({ error: 'QQ account already exists or is linked' }, 409);
+				}
+				return handleError(e);
+			}
+		}
+
+		// POST /api/auth/qq/password-login
+		if (url.pathname === '/api/auth/qq/password-login' && method === 'POST') {
+			try {
+				const body = await request.json() as any;
+				const ip = request.headers.get('CF-Connecting-IP') || '127.0.0.1';
+				if (!(await checkTurnstile(body, ip))) {
+					return jsonResponse({ error: 'Turnstile verification failed' }, 403);
+				}
+
+				const qqId = normalizeQqId(body.qq_id);
+				const password = String(body.password || '');
+				if (!qqId || !password) return jsonResponse({ error: 'Missing QQ number or password' }, 400);
+
+				const user = await env.cforum_db.prepare('SELECT * FROM users WHERE qq_id = ?').bind(qqId).first<DBUser>();
+				if (!user || !isUsablePasswordHash(user.password)) {
+					return jsonResponse({ error: 'QQ number or password error' }, 401);
+				}
+				if (!user.verified) return jsonResponse({ error: 'Please verify your account first' }, 403);
+
+				const passwordHash = await hashPassword(password);
+				if (user.password !== passwordHash) {
+					return jsonResponse({ error: 'QQ number or password error' }, 401);
+				}
+
+				const totpStatus = await verifyTotpForUser(user, body.totp_code);
+				if (totpStatus === 'required') return jsonResponse({ error: 'TOTP_REQUIRED' }, 403);
+				if (totpStatus === 'not_configured') return jsonResponse({ error: 'TOTP not configured' }, 500);
+				if (totpStatus === 'invalid') return jsonResponse({ error: 'Invalid TOTP code' }, 401);
+
+				return jsonResponse(await createForumSession(user, 'LOGIN_QQ_PASSWORD', { qq_id: qqId }));
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
+		// POST /api/user/qq/request-bind
+		if (url.pathname === '/api/user/qq/request-bind' && method === 'POST') {
+			try {
+				const userPayload = await authenticate(request);
+				const user = await env.cforum_db.prepare('SELECT * FROM users WHERE id = ?').bind(userPayload.id).first<DBUser>();
+				if (!user) return jsonResponse({ error: 'User not found' }, 404);
+				if (user.qq_id) return jsonResponse({ error: 'This account already has a QQ number linked' }, 409);
+
+				const status = await getQqBotStatus();
+				if (!status.available) {
+					return jsonResponse({ error: status.reason || 'QQ bot is unavailable', status }, 503);
+				}
+
+				await cleanupExpiredQqChallenges();
+				const sessionId = crypto.randomUUID();
+				const code = generateQqCode();
+				const now = Math.floor(Date.now() / 1000);
+				await env.cforum_db.prepare(
+					'INSERT INTO qq_login_challenges (session_id, code, purpose, requester_user_id, status, created_at, expires_at) VALUES (?, ?, "bind", ?, "pending", ?, ?)'
+				).bind(sessionId, code, userPayload.id, now, now + QQ_CODE_TTL_SECONDS).run();
+
+				return jsonResponse({
+					session_id: sessionId,
+					code,
+					expires_in: QQ_CODE_TTL_SECONDS,
+					bot_qq: (status as any).bot_qq || '',
+					message: `请将验证码 ${code} 通过 QQ 私聊发送给机器人完成绑定`,
+				});
+			} catch (e: any) {
+				if (String(e?.message || e).includes('UNIQUE constraint failed')) {
+					return jsonResponse({ error: '验证码生成冲突，请重试' }, 409);
+				}
+				return handleError(e);
+			}
+		}
+
+		// POST /api/internal/qq/verify-code
+		if (url.pathname === '/api/internal/qq/verify-code' && method === 'POST') {
+			try {
+				requireForumBridgeAuth();
+				const body = await request.json() as any;
+				const code = normalizeQqCode(body.code);
+				const qqId = normalizeQqId(body.qq_id);
+				if (!code || !qqId) return jsonResponse({ ok: false, message: '验证码或 QQ 号格式错误' }, 400);
+
+				const challenge = await env.cforum_db.prepare('SELECT * FROM qq_login_challenges WHERE code = ?').bind(code).first<any>();
+				if (!challenge) return jsonResponse({ ok: false, message: '验证码不存在或已失效' }, 404);
+				const now = Math.floor(Date.now() / 1000);
+				if (Number(challenge.expires_at) < now) {
+					await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE session_id = ?').bind(challenge.session_id).run();
+					return jsonResponse({ ok: false, message: '验证码已过期，请在论坛页面重新获取' }, 400);
+				}
+				if (challenge.status !== 'pending') {
+					return jsonResponse({ ok: false, message: '验证码已使用' }, 400);
+				}
+
+				const nickname = cleanUsernameCandidate(String(body.nickname || '')).slice(0, 50);
+				const avatarUrl = safeQqAvatarUrl(qqId, body.avatar_url);
+
+				if (challenge.purpose === 'bind') {
+					const requesterId = Number(challenge.requester_user_id || 0);
+					if (!requesterId) return jsonResponse({ ok: false, message: '绑定会话无效' }, 400);
+					const conflict = await env.cforum_db.prepare('SELECT id FROM users WHERE qq_id = ? AND id != ?').bind(qqId, requesterId).first<{ id: number }>();
+					if (conflict) {
+						await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE session_id = ?').bind(challenge.session_id).run();
+						return jsonResponse({ ok: false, message: '该 QQ 已绑定其他论坛账号，请联系管理员处理' }, 409);
+					}
+					const requester = await env.cforum_db.prepare('SELECT id, qq_id FROM users WHERE id = ?').bind(requesterId).first<{ id: number; qq_id?: string | null }>();
+					if (!requester) return jsonResponse({ ok: false, message: '绑定账号不存在' }, 404);
+					if (requester.qq_id) return jsonResponse({ ok: false, message: '该论坛账号已经绑定 QQ' }, 409);
+
+					await env.cforum_db.prepare(
+						'UPDATE users SET qq_id = ?, qq_nickname = ?, qq_bound_at = CURRENT_TIMESTAMP, avatar_url = COALESCE(avatar_url, ?) WHERE id = ?'
+					).bind(qqId, nickname || null, avatarUrl, requesterId).run();
+					await env.cforum_db.prepare(
+						'UPDATE qq_login_challenges SET status = "verified", qq_id = ?, qq_nickname = ?, avatar_url = ?, verified_at = ? WHERE session_id = ?'
+					).bind(qqId, nickname || null, avatarUrl, now, challenge.session_id).run();
+					await security.logAudit(requesterId, 'LINK_QQ_LOGIN', 'user', String(requesterId), { qq_id: qqId }, request);
+					return jsonResponse({ ok: true, message: '✅ QQ 绑定成功，请回到论坛设置页查看。' });
+				}
+
+				await env.cforum_db.prepare(
+					'UPDATE qq_login_challenges SET status = "verified", qq_id = ?, qq_nickname = ?, avatar_url = ?, verified_at = ? WHERE session_id = ?'
+				).bind(qqId, nickname || null, avatarUrl, now, challenge.session_id).run();
+				return jsonResponse({ ok: true, message: '✅ QQ 验证成功，请回到论坛页面完成登录。' });
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
 		// POST /api/login
 		if (url.pathname === '/api/login' && method === 'POST') {
 			try {
@@ -636,15 +1027,7 @@ export default {
 
 				return jsonResponse({
 					token,
-					user: {
-						id: user.id,
-						email: user.email,
-						username: user.username,
-						avatar_url: user.avatar_url,
-						role: user.role || 'user',
-						totp_enabled: !!user.totp_enabled,
-						email_notifications: user.email_notifications === 1
-					}
+					user: toPublicUser(user)
 				});
 			} catch (e) {
 				return handleError(e);
@@ -748,15 +1131,7 @@ export default {
 
 				return jsonResponse({
 					token,
-					user: {
-						id: user.id,
-						email: user.email,
-						username: user.username,
-						avatar_url: user.avatar_url,
-						role: user.role || 'user',
-						totp_enabled: !!user.totp_enabled,
-						email_notifications: user.email_notifications === 1
-					}
+					user: toPublicUser(user)
 				});
 			} catch (e: any) {
 				if (e.message && e.message.includes('UNIQUE constraint failed')) {
@@ -823,16 +1198,42 @@ export default {
 			if (!user) return jsonResponse({ error: 'User not found' }, 404);
 				return jsonResponse({
 					success: true,
-					user: {
-						id: user.id,
-						email: user.email,
-						username: user.username,
-						avatar_url: user.avatar_url,
-						role: user.role || 'user',
-						totp_enabled: !!user.totp_enabled,
-						email_notifications: user.email_notifications === 1
-					}
+					user: toPublicUser(user)
 				});
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
+		// POST /api/user/password
+		if (url.pathname === '/api/user/password' && method === 'POST') {
+			try {
+				const userPayload = await authenticate(request);
+				const body = await request.json() as any;
+				const currentPassword = String(body.current_password || '');
+				const newPassword = String(body.new_password || '');
+				const user = await env.cforum_db.prepare('SELECT * FROM users WHERE id = ?').bind(userPayload.id).first<DBUser>();
+				if (!user) return jsonResponse({ error: 'User not found' }, 404);
+				if (newPassword.length < 8 || newPassword.length > 16) {
+					return jsonResponse({ error: 'Password must be 8-16 characters' }, 400);
+				}
+
+				if (isUsablePasswordHash(user.password)) {
+					if (!currentPassword) return jsonResponse({ error: 'Missing current password' }, 400);
+					const currentHash = await hashPassword(currentPassword);
+					if (currentHash !== user.password) return jsonResponse({ error: 'Invalid current password' }, 401);
+				}
+
+				const totpStatus = await verifyTotpForUser(user, body.totp_code);
+				if (totpStatus === 'required') return jsonResponse({ error: 'TOTP_REQUIRED' }, 403);
+				if (totpStatus === 'not_configured') return jsonResponse({ error: 'TOTP not configured' }, 500);
+				if (totpStatus === 'invalid') return jsonResponse({ error: 'Invalid TOTP code' }, 401);
+
+				const newHash = await hashPassword(newPassword);
+				await env.cforum_db.prepare('UPDATE users SET password = ? WHERE id = ?').bind(newHash, user.id).run();
+				const updated = await env.cforum_db.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first<DBUser>();
+				await security.logAudit(user.id, 'SET_PASSWORD', 'user', String(user.id), { had_password: isUsablePasswordHash(user.password) }, request);
+				return jsonResponse({ success: true, user: updated ? toPublicUser(updated) : toPublicUser({ ...user, password: newHash }) });
 			} catch (e) {
 				return handleError(e);
 			}

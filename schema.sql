@@ -22,6 +22,9 @@ CREATE TABLE users (
   pending_email TEXT,
   email_change_token TEXT,
   google_sub TEXT,
+  qq_id TEXT,
+  qq_nickname TEXT,
+  qq_bound_at TIMESTAMP,
   avatar_url TEXT,
   nickname TEXT,
   email_notifications INTEGER DEFAULT 1,
@@ -29,6 +32,24 @@ CREATE TABLE users (
 );
 
 CREATE UNIQUE INDEX idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;
+CREATE UNIQUE INDEX idx_users_qq_id ON users(qq_id) WHERE qq_id IS NOT NULL;
+
+CREATE TABLE qq_login_challenges (
+  session_id TEXT PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  purpose TEXT NOT NULL CHECK (purpose IN ('login', 'bind')),
+  requester_user_id INTEGER,
+  qq_id TEXT,
+  qq_nickname TEXT,
+  avatar_url TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  verified_at INTEGER
+);
+
+CREATE INDEX idx_qq_login_challenges_code ON qq_login_challenges(code);
+CREATE INDEX idx_qq_login_challenges_expires ON qq_login_challenges(expires_at);
 
 CREATE TABLE categories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -31,6 +31,12 @@ export function SettingsPage() {
 
 	const [deletePassword, setDeletePassword] = React.useState('');
 	const [deleteTotp, setDeleteTotp] = React.useState('');
+	const [bindQqSessionId, setBindQqSessionId] = React.useState('');
+	const [bindQqCode, setBindQqCode] = React.useState('');
+	const [bindQqText, setBindQqText] = React.useState('');
+	const [currentPassword, setCurrentPassword] = React.useState('');
+	const [newPassword, setNewPassword] = React.useState('');
+	const [passwordTotp, setPasswordTotp] = React.useState('');
 
 	React.useEffect(() => {
 		if (!user) {
@@ -42,6 +48,35 @@ export function SettingsPage() {
 		if (!totpUri || !qrCanvasRef.current) return;
 		QRCode.toCanvas(qrCanvasRef.current, totpUri).catch(() => {});
 	}, [totpUri]);
+
+	React.useEffect(() => {
+		if (!bindQqSessionId) return;
+		let cancelled = false;
+		const timer = window.setInterval(async () => {
+			try {
+				const data = await apiFetch<{ status: string; user?: User | null }>(`/auth/qq/check/${encodeURIComponent(bindQqSessionId)}`);
+				if (cancelled) return;
+				if (data.status === 'bound' && data.user) {
+					window.clearInterval(timer);
+					setBindQqSessionId('');
+					setBindQqCode('');
+					setBindQqText('QQ 绑定成功');
+					setUser(data.user);
+					setUserState(data.user);
+				} else if (data.status === 'expired' || data.status === 'not_found') {
+					window.clearInterval(timer);
+					setBindQqSessionId('');
+					setBindQqText('验证码已过期，请重新获取');
+				}
+			} catch (e: any) {
+				if (!cancelled) setBindQqText(String(e?.message || e));
+			}
+		}, 2000);
+		return () => {
+			cancelled = true;
+			window.clearInterval(timer);
+		};
+	}, [bindQqSessionId]);
 
 	async function saveProfile() {
 		if (!user) return;
@@ -113,6 +148,57 @@ export function SettingsPage() {
 			alert('验证邮件已发送至新地址，请前往新邮箱确认。');
 			setEmailNew('');
 			setEmailTotp('');
+		} catch (e: any) {
+			setError(String(e?.message || e));
+		} finally {
+			setLoading(false);
+		}
+	}
+
+	async function requestQqBind() {
+		if (!user) return;
+		setError('');
+		setLoading(true);
+		try {
+			const data = await apiFetch<{ session_id: string; code: string; bot_qq?: string }>('/user/qq/request-bind', {
+				method: 'POST',
+				headers: getSecurityHeaders('POST'),
+				body: JSON.stringify({})
+			});
+			setBindQqSessionId(data.session_id);
+			setBindQqCode(data.code);
+			setBindQqText(`请将验证码私聊发送给机器人${data.bot_qq ? `（QQ: ${data.bot_qq}）` : ''}`);
+			if (navigator.clipboard && window.isSecureContext) {
+				navigator.clipboard.writeText(data.code).catch(() => {});
+			}
+		} catch (e: any) {
+			setError(String(e?.message || e));
+		} finally {
+			setLoading(false);
+		}
+	}
+
+	async function savePassword() {
+		if (!user) return;
+		setError('');
+		if (newPassword.length < 8 || newPassword.length > 16) return setError('密码必须为 8-16 字符');
+		setLoading(true);
+		try {
+			const data = await apiFetch<{ user: User }>('/user/password', {
+				method: 'POST',
+				headers: getSecurityHeaders('POST'),
+				body: JSON.stringify({
+					current_password: currentPassword,
+					new_password: newPassword,
+					totp_code: passwordTotp
+				})
+			});
+			setUser(data.user);
+			setUserState(data.user);
+			setCurrentPassword('');
+			setNewPassword('');
+			setPasswordTotp('');
+			alert(user.has_password ? '密码已更新' : '密码已设置');
 		} catch (e: any) {
 			setError(String(e?.message || e));
 		} finally {
@@ -277,6 +363,83 @@ export function SettingsPage() {
 							{loading ? '处理中...' : '发送确认邮件'}
 						</Button>
 						<div className="text-sm text-muted-foreground">确认链接将发送到新邮箱。</div>
+					</CardContent>
+				</Card>
+
+				<Card>
+					<CardHeader>
+						<CardTitle>QQ 登录</CardTitle>
+					</CardHeader>
+					<CardContent className="space-y-4">
+						{user?.qq_id ? (
+							<div className="rounded-md border bg-muted/30 p-3 text-sm">
+								已绑定 QQ：{user.qq_nickname ? `${user.qq_nickname} (${user.qq_id})` : user.qq_id}
+							</div>
+						) : (
+							<>
+								<Button onClick={requestQqBind} disabled={loading || !!bindQqSessionId}>
+									{loading ? '处理中...' : '绑定 QQ'}
+								</Button>
+								{bindQqCode ? (
+									<div className="space-y-2 rounded-md border p-4 text-center">
+										<div className="font-mono text-3xl font-semibold tracking-normal">{bindQqCode}</div>
+										<div className="text-sm text-muted-foreground">{bindQqText || '等待 QQ 私聊验证...'}</div>
+										<Button type="button" variant="outline" size="sm" onClick={() => navigator.clipboard?.writeText(bindQqCode).catch(() => {})}>
+											复制验证码
+										</Button>
+									</div>
+								) : (
+									<div className="text-sm text-muted-foreground">绑定后可以使用 QQ 私聊验证码登录，也可以设置密码作为 QQ 号登录的兜底方式。</div>
+								)}
+							</>
+						)}
+					</CardContent>
+				</Card>
+
+				<Card>
+					<CardHeader>
+						<CardTitle>{user?.has_password ? '修改密码' : '设置密码'}</CardTitle>
+					</CardHeader>
+					<CardContent className="space-y-4">
+						<div className="grid gap-4 sm:grid-cols-2">
+							{user?.has_password ? (
+								<div className="space-y-2">
+									<Label htmlFor="password-current">当前密码</Label>
+									<Input
+										id="password-current"
+										type="password"
+										autoComplete="current-password"
+										value={currentPassword}
+										onChange={(e) => setCurrentPassword(e.target.value)}
+									/>
+								</div>
+							) : null}
+							<div className="space-y-2">
+								<Label htmlFor="password-new">新密码 (8-16 字符)</Label>
+								<Input
+									id="password-new"
+									type="password"
+									autoComplete="new-password"
+									value={newPassword}
+									onChange={(e) => setNewPassword(e.target.value)}
+								/>
+							</div>
+							<div className="space-y-2">
+								<Label htmlFor="password-totp">双重验证码 (若开启)</Label>
+								<Input
+									id="password-totp"
+									type="text"
+									inputMode="numeric"
+									maxLength={6}
+									autoComplete="one-time-code"
+									value={passwordTotp}
+									onChange={(e) => setPasswordTotp(e.target.value)}
+								/>
+							</div>
+						</div>
+						<Button onClick={savePassword} disabled={loading}>
+							{loading ? '处理中...' : user?.has_password ? '保存新密码' : '设置密码'}
+						</Button>
 					</CardContent>
 				</Card>
 

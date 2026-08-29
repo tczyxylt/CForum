@@ -6,6 +6,9 @@ export type User = {
 	role?: 'user' | 'admin';
 	totp_enabled?: boolean;
 	email_notifications?: boolean;
+	qq_id?: string | null;
+	qq_nickname?: string | null;
+	has_password?: boolean;
 };
 
 const TOKEN_KEY = 'token';

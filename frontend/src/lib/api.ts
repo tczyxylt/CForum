@@ -7,6 +7,9 @@ export type ForumConfig = {
 	google_client_id?: string;
 	user_count?: number;
 	jwt_secret_configured?: boolean; // indicates whether JWT_SECRET is set in backend
+	email_provider?: string;
+	resend_configured?: boolean;
+	smtp_configured?: boolean;
 };
 
 export type Category = {

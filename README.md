@@ -93,7 +93,33 @@
 | `TURNSTILE_SITE_KEY` | Cloudflare Turnstile Site Key | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则不启用 Turnstile |
 | `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile Secret | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则不启用 Turnstile |
 | `GOOGLE_CLIENT_ID` | Google OAuth Web Client ID | 在 Google Cloud Console 创建 OAuth Web Client，并把站点域名加入 Authorized JavaScript origins | 非必需，未配置则不显示 Google 登录 |
+| `QQ_BOT_AUTH_URL` | Bot WebUI 地址 | 例如：`https://bot.awacat.cc`，论坛用它检测 OneBot/NapCat 状态 | QQ 登录必需 |
+| `CFORUM_AUTH_TOKEN` | 论坛与 Bot 共享密钥 | 同一个值也要写入 bot 的 `config.json`，用于 QQ 登录桥鉴权 | QQ 登录必需 |
 <img width="2244" height="1350" alt="图片" src="https://github.com/user-attachments/assets/77b109a9-ebb6-4e9d-a660-0828e28c5bd1" />
+
+#### QQ 登录配置
+
+如果要启用 QQ 登录，GitHub Secrets 里必须同时配置：
+
+- `QQ_BOT_AUTH_URL`：bot WebUI 的公网地址，例如 `https://bot.awacat.cc`
+- `CFORUM_AUTH_TOKEN`：论坛和 bot 共用的长随机密钥
+
+bot 服务器上的 `config.json` 也要加入同一个论坛地址和同一个共享密钥：
+
+```json
+{
+  "CFORUM_AUTH_URL": "https://forum.adysec.com",
+  "CFORUM_AUTH_TOKEN": "和 GitHub Secrets 里相同的长随机密钥"
+}
+```
+
+推送到 `main` 后，GitHub Actions 会自动：
+
+1. 构建前端资源
+2. 确保 D1 数据库存在
+3. 执行 `migrations/` 里的 D1 迁移
+4. 上传 QQ 登录桥接密钥到 Worker
+5. 部署 Worker 和 Pages
 
 #### 第四步：手动触发部署
 

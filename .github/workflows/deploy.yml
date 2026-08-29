@@ -65,12 +65,57 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
-      - name: Apply D1 migrations
+      - name: Ensure D1 schema upgrades
         run: |
           set -euo pipefail
 
-          echo "🗄️ Applying D1 migrations..."
-          npx wrangler d1 migrations apply cforum-db --remote
+          query_has_rows() {
+            local sql="$1"
+            npx wrangler d1 execute cforum-db --remote --json --command "$sql" | node -e '
+              let input = "";
+              process.stdin.on("data", c => input += c);
+              process.stdin.on("end", () => {
+                const payload = JSON.parse(input || "[]");
+                const rows = (Array.isArray(payload) ? payload : [payload])
+                  .flatMap(item => item.results || item.result || []);
+                process.exit(rows.length > 0 ? 0 : 1);
+              });
+            '
+          }
+
+          execute_sql() {
+            local sql="$1"
+            npx wrangler d1 execute cforum-db --remote --command "$sql"
+          }
+
+          ensure_column() {
+            local table="$1"
+            local column="$2"
+            local definition="$3"
+            if query_has_rows "SELECT name FROM pragma_table_info('$table') WHERE name='$column'"; then
+              echo "✅ Column $table.$column already exists"
+            else
+              echo "➕ Adding column $table.$column"
+              execute_sql "ALTER TABLE $table ADD COLUMN $column $definition"
+            fi
+          }
+
+          echo "🗄️ Ensuring non-destructive D1 schema upgrades..."
+
+          if query_has_rows "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"; then
+            ensure_column users google_sub "TEXT"
+            ensure_column users qq_id "TEXT"
+            ensure_column users qq_nickname "TEXT"
+            ensure_column users qq_bound_at "TIMESTAMP"
+            execute_sql "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL"
+            execute_sql "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_qq_id ON users(qq_id) WHERE qq_id IS NOT NULL"
+          else
+            echo "⏭️ users table does not exist yet; Worker runtime will create the base schema on first request"
+          fi
+
+          execute_sql "CREATE TABLE IF NOT EXISTS qq_login_challenges (session_id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, purpose TEXT NOT NULL CHECK (purpose IN ('login', 'bind')), requester_user_id INTEGER, qq_id TEXT, qq_nickname TEXT, avatar_url TEXT, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, verified_at INTEGER)"
+          execute_sql "CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_code ON qq_login_challenges(code)"
+          execute_sql "CREATE INDEX IF NOT EXISTS idx_qq_login_challenges_expires ON qq_login_challenges(expires_at)"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}

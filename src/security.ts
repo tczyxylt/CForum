@@ -48,9 +48,14 @@ export class Security {
             if (typeof jti !== 'string' || !jti) return null;
 
             const session = await this.env.cforum_db
-                .prepare('SELECT user_id, expires_at FROM sessions WHERE jti = ?')
+                .prepare(`
+                    SELECT sessions.user_id, sessions.expires_at, users.role, users.email
+                    FROM sessions
+                    JOIN users ON users.id = sessions.user_id
+                    WHERE sessions.jti = ?
+                `)
                 .bind(jti)
-                .first();
+                .first() as { user_id: number; expires_at: number; role?: string; email?: string } | null;
             if (!session) return null;
             if (Number(session.user_id) !== id) return null;
             if (Number(session.expires_at) <= Math.floor(Date.now() / 1000)) return null;
@@ -59,7 +64,11 @@ export class Security {
                 await this.env.cforum_db.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(Math.floor(Date.now() / 1000)).run();
             }
 
-            return { id, role, email };
+            return {
+                id,
+                role: session.role || role,
+                email: session.email || email
+            };
         } catch (e) {
             return null;
         }

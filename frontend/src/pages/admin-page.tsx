@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { RefreshCw, Shield, User as UserIcon } from 'lucide-react';
+import { RefreshCw, Shield, ShieldCheck, ShieldX, User as UserIcon } from 'lucide-react';
 
 import { PageShell } from '@/components/page-shell';
 import { Button } from '@/components/ui/button';
@@ -9,19 +9,28 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { apiFetch, getSecurityHeaders, type Category } from '@/lib/api';
-import { getToken, getUser } from '@/lib/auth';
+import { getToken, getUser, setUser, type User } from '@/lib/auth';
+
+type AdminUser = {
+	id: number;
+	email: string;
+	username: string;
+	role: 'admin' | 'user';
+	verified: number;
+	created_at: string;
+	avatar_url?: string | null;
+};
 
 export function AdminPage() {
 	const token = getToken();
-	const user = React.useMemo(() => getUser(), [token]);
+	const [user, setCurrentUser] = React.useState<User | null>(() => getUser());
+	const [checkingSession, setCheckingSession] = React.useState(!!token);
 	const isAdmin = user?.role === 'admin';
 	const [error, setError] = React.useState('');
 	const [loading, setLoading] = React.useState(false);
 
 	const [stats, setStats] = React.useState<{ users: number; posts: number; comments: number } | null>(null);
-	const [users, setUsers] = React.useState<
-		Array<{ id: number; email: string; username: string; role: string; verified: number; created_at: string; avatar_url?: string | null }>
-	>([]);
+	const [users, setUsers] = React.useState<AdminUser[]>([]);
 	const [categories, setCategories] = React.useState<Category[]>([]);
 	const [systemSettings, setSystemSettings] = React.useState({
 		turnstile_enabled: false,
@@ -47,8 +56,29 @@ export function AdminPage() {
 	}, [token]);
 
 	React.useEffect(() => {
-		if (token && !isAdmin) setError('无权限访问管理后台');
-	}, [token, isAdmin]);
+		if (!token) return;
+		let cancelled = false;
+		setCheckingSession(true);
+		apiFetch<{ user: User }>('/user/me', { headers: getSecurityHeaders('GET') })
+			.then((data) => {
+				if (cancelled) return;
+				setUser(data.user);
+				setCurrentUser(data.user);
+			})
+			.catch((e: any) => {
+				if (!cancelled) setError(String(e?.message || e));
+			})
+			.finally(() => {
+				if (!cancelled) setCheckingSession(false);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [token]);
+
+	React.useEffect(() => {
+		if (token && !checkingSession && !isAdmin) setError('无权限访问管理后台');
+	}, [token, checkingSession, isAdmin]);
 
 	const refresh = React.useCallback(async () => {
 		if (!isAdmin) return;
@@ -57,12 +87,12 @@ export function AdminPage() {
 		try {
 			const [s, u, c, settings] = await Promise.all([
 				apiFetch<{ users: number; posts: number; comments: number }>('/admin/stats', { headers: getSecurityHeaders('GET') }),
-				apiFetch<any[]>('/admin/users', { headers: getSecurityHeaders('GET') }),
+				apiFetch<AdminUser[]>('/admin/users', { headers: getSecurityHeaders('GET') }),
 				apiFetch<Category[]>('/categories'),
 				apiFetch<any>('/admin/settings', { headers: getSecurityHeaders('GET') })
 			]);
 			setStats(s);
-			setUsers(u as any);
+			setUsers(u);
 			setCategories(c);
 			setSystemSettings({
 				turnstile_enabled: !!settings.turnstile_enabled,
@@ -230,6 +260,28 @@ export function AdminPage() {
 		}
 	}
 
+	async function updateUserRole(targetUser: AdminUser, role: 'admin' | 'user') {
+		if (targetUser.id === user?.id) return;
+		const message = role === 'admin'
+			? `确定授予 ${targetUser.username} 管理员权限？`
+			: `确定取消 ${targetUser.username} 的管理员权限？`;
+		if (!confirm(message)) return;
+		setLoading(true);
+		setError('');
+		try {
+			await apiFetch(`/admin/users/${targetUser.id}/role`, {
+				method: 'POST',
+				headers: getSecurityHeaders('POST'),
+				body: JSON.stringify({ role })
+			});
+			setUsers((current) => current.map((item) => item.id === targetUser.id ? { ...item, role } : item));
+		} catch (e: any) {
+			setError(String(e?.message || e));
+		} finally {
+			setLoading(false);
+		}
+	}
+
 	return (
 		<PageShell>
 			<div className="space-y-6">
@@ -244,7 +296,11 @@ export function AdminPage() {
 					</Button>
 				</div>
 
-				{user?.role !== 'admin' ? (
+				{checkingSession ? (
+					<Card>
+						<CardContent className="py-6 text-sm text-muted-foreground">正在检查权限...</CardContent>
+					</Card>
+				) : user?.role !== 'admin' ? (
 					<Card>
 						<CardContent className="py-6 text-sm text-muted-foreground">无权限访问</CardContent>
 					</Card>
@@ -475,6 +531,31 @@ export function AdminPage() {
 																		重发
 																	</Button>
 																</>
+															) : null}
+															{user?.id !== u.id ? (
+																u.role === 'admin' ? (
+																	<Button
+																		variant="outline"
+																		size="sm"
+																		className="border-slate-500 text-slate-700 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-900/50"
+																		disabled={loading}
+																		onClick={() => updateUserRole(u, 'user')}
+																	>
+																		<ShieldX className="h-4 w-4" />
+																		取消管理
+																	</Button>
+																) : (
+																	<Button
+																		variant="outline"
+																		size="sm"
+																		className="border-indigo-500 text-indigo-700 hover:bg-indigo-50 hover:text-indigo-800 dark:text-indigo-300 dark:hover:bg-indigo-950/40"
+																		disabled={loading}
+																		onClick={() => updateUserRole(u, 'admin')}
+																	>
+																		<ShieldCheck className="h-4 w-4" />
+																		设为管理
+																	</Button>
+																)
 															) : null}
 															{user?.id !== u.id ? (
 																<Button variant="destructive" size="sm" onClick={() => deleteUser(u.id)}>

@@ -1,7 +1,8 @@
 import * as React from 'react';
 
 import { SiteHeader } from '@/components/site-header';
-import { getUser, type User } from '@/lib/auth';
+import { apiFetch, getSecurityHeaders } from '@/lib/api';
+import { getToken, getUser, setUser as persistUser, type User } from '@/lib/auth';
 import { useConfig } from '@/hooks/use-config';
 
 export function PageShell({
@@ -9,9 +10,26 @@ export function PageShell({
 }: {
 	children: React.ReactNode;
 }) {
-	const [user, setUser] = React.useState<User | null>(() => getUser());
+	const [user, setCurrentUser] = React.useState<User | null>(() => getUser());
 	const { config } = useConfig();
 	const [generatedSecret, setGeneratedSecret] = React.useState<string>('');
+
+	React.useEffect(() => {
+		if (!getToken()) return;
+		let cancelled = false;
+		apiFetch<{ user: User }>('/user/me', { headers: getSecurityHeaders('GET') })
+			.then((data) => {
+				if (cancelled) return;
+				persistUser(data.user);
+				setCurrentUser(data.user);
+			})
+			.catch(() => {
+				if (!cancelled) setCurrentUser(null);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, []);
 
 	// if jwt not configured, generate a base64-secret for display
 	React.useEffect(() => {
@@ -25,7 +43,7 @@ export function PageShell({
 
 	return (
 		<div className="min-h-dvh">
-			<SiteHeader currentUser={user} onLogout={() => setUser(null)} />
+			<SiteHeader currentUser={user} onLogout={() => setCurrentUser(null)} />
 			{/* warning banner if jwt secret missing */}
 			{config && config.jwt_secret_configured === false && (
 				<div className="bg-yellow-200 text-yellow-800 px-4 py-2 text-sm">

@@ -499,6 +499,13 @@ export default {
 			return payload;
 		};
 
+		const getAuthenticatedUser = async (req: Request) => {
+			const payload = await authenticate(req);
+			const user = await env.cforum_db.prepare('SELECT * FROM users WHERE id = ?').bind(payload.id).first<DBUser>();
+			if (!user) throw new Error('Auth Unauthorized');
+			return user;
+		};
+
 		// Helper to handle errors
 		const handleError = (e: any) => {
 			const errString = String(e);
@@ -1141,6 +1148,16 @@ export default {
 			}
 		}
 
+		// GET /api/user/me
+		if (url.pathname === '/api/user/me' && method === 'GET') {
+			try {
+				const user = await getAuthenticatedUser(request);
+				return jsonResponse({ user: toPublicUser(user) });
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
 		// POST /api/user/profile
 		if (url.pathname === '/api/user/profile' && method === 'POST') {
 			try {
@@ -1721,6 +1738,33 @@ const user = await env.cforum_db.prepare('SELECT * FROM users WHERE email_change
 
 				const { results } = await env.cforum_db.prepare('SELECT id, email, username, role, verified, created_at, avatar_url FROM users ORDER BY created_at DESC').all();
 				return jsonResponse(results);
+			} catch (e) {
+				return handleError(e);
+			}
+		}
+
+		// POST /api/admin/users/:id/role
+		if (url.pathname.match(/^\/api\/admin\/users\/\d+\/role$/) && method === 'POST') {
+			const id = Number(url.pathname.split('/')[4]);
+			try {
+				const userPayload = await authenticate(request);
+				if (userPayload.role !== 'admin') return jsonResponse({ error: 'Unauthorized' }, 403);
+				if (!Number.isInteger(id) || id <= 0) return jsonResponse({ error: 'Invalid user id' }, 400);
+				if (id === userPayload.id) return jsonResponse({ error: 'Cannot change your own role' }, 400);
+
+				const body = await request.json() as any;
+				const role = String(body.role || '');
+				if (role !== 'admin' && role !== 'user') {
+					return jsonResponse({ error: 'Invalid role' }, 400);
+				}
+
+				const target = await env.cforum_db.prepare('SELECT id, role FROM users WHERE id = ?').bind(id).first<{ id: number; role?: string }>();
+				if (!target) return jsonResponse({ error: 'User not found' }, 404);
+
+				await env.cforum_db.prepare('UPDATE users SET role = ? WHERE id = ?').bind(role, id).run();
+				await security.logAudit(userPayload.id, 'ADMIN_UPDATE_USER_ROLE', 'user', String(id), { from: target.role || 'user', to: role }, request);
+
+				return jsonResponse({ success: true, role });
 			} catch (e) {
 				return handleError(e);
 			}

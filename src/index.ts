@@ -228,6 +228,29 @@ async function verifyTurnstile(token: string, ip: string, secretKey: string): Pr
 	return outcome.success;
 }
 
+async function deleteUserDatabaseRows(db: D1Database, userId: number | string): Promise<void> {
+	await db.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId).run();
+	await db.prepare('DELETE FROM qq_login_challenges WHERE requester_user_id = ?').bind(userId).run();
+
+	await db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(userId).run();
+	await db.prepare('DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(userId).run();
+
+	await db.prepare(`
+WITH RECURSIVE user_comment_tree(id) AS (
+  SELECT id FROM comments WHERE author_id = ?
+  UNION
+  SELECT comments.id
+  FROM comments
+  INNER JOIN user_comment_tree ON comments.parent_id = user_comment_tree.id
+)
+DELETE FROM comments WHERE id IN (SELECT id FROM user_comment_tree)
+`).bind(userId).run();
+
+	await db.prepare('DELETE FROM likes WHERE user_id = ?').bind(userId).run();
+	await db.prepare('DELETE FROM posts WHERE author_id = ?').bind(userId).run();
+	await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+}
+
 export default {
 	async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
@@ -1312,17 +1335,7 @@ export default {
 					 ctx.waitUntil(Promise.all(deletionPromises).catch(err => console.error('Failed to delete user images', err)));
 				}
 
-				// 2. Delete likes/comments ON user's posts (Cascade manually)
-				await env.cforum_db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(user_id).run();
-				await env.cforum_db.prepare('DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(user_id).run();
-
-				// 3. Delete user's activity
-				await env.cforum_db.prepare('DELETE FROM likes WHERE user_id = ?').bind(user_id).run();
-				await env.cforum_db.prepare('DELETE FROM comments WHERE author_id = ?').bind(user_id).run();
-				
-				// 4. Delete posts and user
-				await env.cforum_db.prepare('DELETE FROM posts WHERE author_id = ?').bind(user_id).run();
-				await env.cforum_db.prepare('DELETE FROM users WHERE id = ?').bind(user_id).run();
+				await deleteUserDatabaseRows(env.cforum_db, user_id);
 				
 				await security.logAudit(userPayload.id, 'DELETE_ACCOUNT', 'user', String(user_id), {}, request);
 
@@ -1843,6 +1856,7 @@ const user = await env.cforum_db.prepare('SELECT * FROM users WHERE email_change
 		if (url.pathname.startsWith('/api/admin/users/') && method === 'DELETE') {
 			const id = url.pathname.split('/').pop();
 			try {
+				if (!id) return jsonResponse({ error: 'Missing user id' }, 400);
 				const userPayload = await authenticate(request);
 				if (userPayload.role !== 'admin') return jsonResponse({ error: 'Unauthorized' }, 403);
 
@@ -1864,20 +1878,8 @@ const user = await env.cforum_db.prepare('SELECT * FROM users WHERE email_change
 					ctx.waitUntil(Promise.all(deletionPromises).catch(err => console.error('Failed to delete user images', err)));
 				}
 
-				// 1. Delete likes and comments ON the user's posts (to avoid orphans)
-				await env.cforum_db.prepare('DELETE FROM likes WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(id).run();
-				await env.cforum_db.prepare('DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)').bind(id).run();
-
-				// 2. Delete the user's own activity (likes and comments they made)
-				await env.cforum_db.prepare('DELETE FROM likes WHERE user_id = ?').bind(id).run();
-				await env.cforum_db.prepare('DELETE FROM comments WHERE author_id = ?').bind(id).run();
-
-				// 3. Delete the user's posts
-				await env.cforum_db.prepare('DELETE FROM posts WHERE author_id = ?').bind(id).run();
-
-				// 4. Finally, delete the user
 				const userToDelete = await env.cforum_db.prepare('SELECT email, username FROM users WHERE id = ?').bind(id).first();
-				await env.cforum_db.prepare('DELETE FROM users WHERE id = ?').bind(id).run();
+				await deleteUserDatabaseRows(env.cforum_db, id);
 				
 				await security.logAudit(userPayload.id, 'ADMIN_DELETE_USER', 'user', String(id), {}, request);
 

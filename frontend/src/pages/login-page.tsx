@@ -24,7 +24,7 @@ const QQ_CHAT_URL = 'https://qm.qq.com/q/Xz1Vy4UgQE';
 
 function copyCodeAndOpenQq(code: string) {
 	navigator.clipboard?.writeText(code).catch(() => {});
-	window.location.href = QQ_CHAT_URL;
+	window.open(QQ_CHAT_URL, '_blank', 'noopener,noreferrer');
 }
 
 export function LoginPage() {
@@ -86,6 +86,19 @@ export function LoginPage() {
 		const timer = window.setInterval(loadQqStatus, 15000);
 		return () => window.clearInterval(timer);
 	}, [loadQqStatus]);
+
+	React.useEffect(() => {
+		const params = new URLSearchParams(window.location.search);
+		const qqSession = params.get('qq_session') || '';
+		if (!qqSession) return;
+		setLoginMode('qq');
+		setError('');
+		setQqSessionId(qqSession);
+		setQqPollText('正在完成 QQ 登录...');
+		params.delete('qq_session');
+		const query = params.toString();
+		window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`);
+	}, []);
 
 	React.useEffect(() => {
 		if (!qqSessionId) return;

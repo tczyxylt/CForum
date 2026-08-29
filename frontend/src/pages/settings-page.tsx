@@ -16,7 +16,7 @@ const QQ_CHAT_URL = 'https://qm.qq.com/q/Xz1Vy4UgQE';
 
 function copyCodeAndOpenQq(code: string) {
 	navigator.clipboard?.writeText(code).catch(() => {});
-	window.location.href = QQ_CHAT_URL;
+	window.open(QQ_CHAT_URL, '_blank', 'noopener,noreferrer');
 }
 
 export function SettingsPage() {

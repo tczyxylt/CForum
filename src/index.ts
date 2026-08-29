@@ -602,6 +602,12 @@ export default {
 			await env.cforum_db.prepare('DELETE FROM qq_login_challenges WHERE expires_at < ?').bind(Math.floor(Date.now() / 1000)).run();
 		};
 
+		const buildQqReturnUrl = (sessionId: string, targetPath: '/login' | '/settings' = '/login') => {
+			const returnUrl = new URL(targetPath, `${getBaseUrl().replace(/\/+$/, '')}/`);
+			returnUrl.searchParams.set('qq_session', sessionId);
+			return returnUrl.toString();
+		};
+
 
         const publicPaths = [
             '/api/config', '/api/login', '/api/register', '/api/verify', '/api/auth/google',
@@ -979,13 +985,23 @@ export default {
 						'UPDATE qq_login_challenges SET status = "verified", qq_id = ?, qq_nickname = ?, avatar_url = ?, verified_at = ? WHERE session_id = ?'
 					).bind(qqId, nickname || null, avatarUrl, now, challenge.session_id).run();
 					await security.logAudit(requesterId, 'LINK_QQ_LOGIN', 'user', String(requesterId), { qq_id: qqId }, request);
-					return jsonResponse({ ok: true, message: '✅ QQ 绑定成功，请回到论坛设置页查看。' });
+					const returnUrl = buildQqReturnUrl(String(challenge.session_id), '/settings');
+					return jsonResponse({
+						ok: true,
+						return_url: returnUrl,
+						message: `✅ QQ 绑定成功，请回到论坛设置页查看。\n${returnUrl}`,
+					});
 				}
 
 				await env.cforum_db.prepare(
 					'UPDATE qq_login_challenges SET status = "verified", qq_id = ?, qq_nickname = ?, avatar_url = ?, verified_at = ? WHERE session_id = ?'
 				).bind(qqId, nickname || null, avatarUrl, now, challenge.session_id).run();
-				return jsonResponse({ ok: true, message: '✅ QQ 验证成功，请回到论坛页面完成登录。' });
+				const returnUrl = buildQqReturnUrl(String(challenge.session_id), '/login');
+				return jsonResponse({
+					ok: true,
+					return_url: returnUrl,
+					message: `✅ QQ 验证成功，请回到论坛页面完成登录。\n如果论坛页面没有自动跳转，点击此链接完成登录：\n${returnUrl}`,
+				});
 			} catch (e) {
 				return handleError(e);
 			}
@@ -1771,8 +1787,11 @@ const user = await env.cforum_db.prepare('SELECT * FROM users WHERE email_change
 					return jsonResponse({ error: 'Invalid role' }, 400);
 				}
 
-				const target = await env.cforum_db.prepare('SELECT id, role FROM users WHERE id = ?').bind(id).first<{ id: number; role?: string }>();
+				const target = await env.cforum_db.prepare('SELECT id, email, username, role FROM users WHERE id = ?').bind(id).first<{ id: number; email?: string; username?: string; role?: string }>();
 				if (!target) return jsonResponse({ error: 'User not found' }, 404);
+				if (role === 'user' && (target.username === 'Admin' || target.email === 'admin@adysec.com')) {
+					return jsonResponse({ error: 'Admin cannot be demoted' }, 400);
+				}
 
 				await env.cforum_db.prepare('UPDATE users SET role = ? WHERE id = ?').bind(role, id).run();
 				await security.logAudit(userPayload.id, 'ADMIN_UPDATE_USER_ROLE', 'user', String(id), { from: target.role || 'user', to: role }, request);

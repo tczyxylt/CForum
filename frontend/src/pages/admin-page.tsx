@@ -21,6 +21,10 @@ type AdminUser = {
 	avatar_url?: string | null;
 };
 
+function isProtectedAdminUser(user: AdminUser) {
+	return user.username === 'Admin' || user.email === 'admin@adysec.com';
+}
+
 export function AdminPage() {
 	const token = getToken();
 	const [user, setCurrentUser] = React.useState<User | null>(() => getUser());
@@ -262,6 +266,7 @@ export function AdminPage() {
 
 	async function updateUserRole(targetUser: AdminUser, role: 'admin' | 'user') {
 		if (targetUser.id === user?.id) return;
+		if (role === 'user' && isProtectedAdminUser(targetUser)) return;
 		const message = role === 'admin'
 			? `确定授予 ${targetUser.username} 管理员权限？`
 			: `确定取消 ${targetUser.username} 的管理员权限？`;
@@ -538,11 +543,11 @@ export function AdminPage() {
 																		variant="outline"
 																		size="sm"
 																		className="border-slate-500 text-slate-700 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-slate-900/50"
-																		disabled={loading}
+																		disabled={loading || isProtectedAdminUser(u)}
 																		onClick={() => updateUserRole(u, 'user')}
 																	>
 																		<ShieldX className="h-4 w-4" />
-																		取消管理
+																		{isProtectedAdminUser(u) ? '保留管理' : '取消管理'}
 																	</Button>
 																) : (
 																	<Button

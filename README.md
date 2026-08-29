@@ -90,8 +90,9 @@
 | `SMTP_FROM` | 发送者邮箱 | 例如：noreply@example.com（未设置则使用 SMTP_USER） | 非必需，未配置则无法注册 |
 | `SMTP_FROM_NAME` | 发件人显示名称 | 例如：天秤之眼校园论坛（未设置则使用"论坛管理员"） | 非必需，未配置则无法注册 |
 | `BASE_URL` | 站点 URL | 例如：`https://forum.adysec.com`（未设置则自动使用当前请求域名） | 非必需，未配置则邮件异常 |
-| `TURNSTILE_SITE_KEY` | Cloudflare Turnstile Site Key | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则使用Turnstile |
-| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile Secret | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则使用Turnstile |
+| `TURNSTILE_SITE_KEY` | Cloudflare Turnstile Site Key | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则不启用 Turnstile |
+| `TURNSTILE_SECRET_KEY` | Cloudflare Turnstile Secret | [Cloudflare Turnstile](https://dash.cloudflare.com/?to=/:account/turnstile) | 非必需，未配置则不启用 Turnstile |
+| `GOOGLE_CLIENT_ID` | Google OAuth Web Client ID | 在 Google Cloud Console 创建 OAuth Web Client，并把站点域名加入 Authorized JavaScript origins | 非必需，未配置则不显示 Google 登录 |
 <img width="2244" height="1350" alt="图片" src="https://github.com/user-attachments/assets/77b109a9-ebb6-4e9d-a660-0828e28c5bd1" />
 
 #### 第四步：手动触发部署

@@ -17,6 +17,10 @@ export interface S3Env {
 }
 
 function getClient(env: S3Env) {
+    if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) {
+        throw new Error('S3/R2 credentials missing: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY');
+    }
+
     return new AwsClient({
         accessKeyId: env.AWS_ACCESS_KEY_ID,
         secretAccessKey: env.AWS_SECRET_ACCESS_KEY,

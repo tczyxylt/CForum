@@ -3,7 +3,15 @@ import { sendEmail } from './smtp';
 import { generateIdenticon } from './identicon';
 import { uploadImage, deleteImage, listAllKeys, getPublicUrl, getKeyFromUrl, S3Env } from './s3';
 import * as OTPAuth from 'otpauth';
-import { Security, UserPayload } from './security';
+import { Security } from './security';
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
+
+interface AppEnv extends Env {
+    cforum_db: D1Database;
+    BASE_URL?: string;
+    JWT_SECRET?: string;
+    GOOGLE_CLIENT_ID?: string;
+}
 
 interface DBUser {
     id: number;
@@ -21,6 +29,7 @@ interface DBUser {
     pending_email?: string;
     verification_token?: string;
     email_change_token?: string;
+    google_sub?: string | null;
 }
 
 interface PostAuthorInfo {
@@ -35,6 +44,16 @@ interface DBUserEmail { email: string; }
 interface DBUserTotp { totp_secret: string; }
 interface DBCount { count: number; }
 interface DBSetting { value: string; }
+
+interface GoogleIdTokenPayload extends JWTPayload {
+    sub?: string;
+    email?: string;
+    email_verified?: boolean;
+    name?: string;
+    picture?: string;
+}
+
+const GOOGLE_JWKS = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
 
 // Utility to extract image URLs from Markdown content
 function extractImageUrls(content: string): string[] {
@@ -87,6 +106,68 @@ function hasRestrictedKeywords(username: string): boolean {
 	return restricted.some(keyword => username.toLowerCase().includes(keyword.toLowerCase()));
 }
 
+function cleanUsernameCandidate(username: string): string {
+	return username
+		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+		.replace(/[\u200B-\u200F\uFEFF\u2028\u2029\u180E\u3164\u115F\u1160]/g, '')
+		.trim();
+}
+
+async function makeUniqueGoogleUsername(db: D1Database, name: string | undefined, email: string, sub: string): Promise<string> {
+	const emailLocalPart = email.split('@')[0] || '';
+	let base = cleanUsernameCandidate(name || emailLocalPart);
+	if (base.length > 20) base = base.slice(0, 20).trim();
+	if (isVisuallyEmpty(base) || hasRestrictedKeywords(base)) {
+		base = `google_${sub.slice(0, 8)}`;
+	}
+
+	const candidates = [base];
+	const suffix = sub.replace(/[^a-zA-Z0-9]/g, '').slice(0, 6) || crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+	candidates.push(`${base.slice(0, Math.max(1, 19 - suffix.length))}_${suffix}`);
+
+	for (const candidate of candidates) {
+		const existing = await db.prepare('SELECT id FROM users WHERE username = ?').bind(candidate).first<{ id: number }>();
+		if (!existing) return candidate;
+	}
+
+	for (let i = 0; i < 10; i++) {
+		const randomSuffix = crypto.randomUUID().replace(/-/g, '').slice(0, 6);
+		const candidate = `${base.slice(0, 13)}_${randomSuffix}`;
+		const existing = await db.prepare('SELECT id FROM users WHERE username = ?').bind(candidate).first<{ id: number }>();
+		if (!existing) return candidate;
+	}
+
+	return `google_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
+}
+
+async function verifyTotpForUser(user: DBUser, totpCode?: string): Promise<'ok' | 'required' | 'not_configured' | 'invalid'> {
+	if (!user.totp_enabled) return 'ok';
+	if (!totpCode) return 'required';
+	if (!user.totp_secret) return 'not_configured';
+
+	const totp = new OTPAuth.TOTP({
+		algorithm: 'SHA1',
+		digits: 6,
+		period: 30,
+		secret: OTPAuth.Secret.fromBase32(String(user.totp_secret)),
+	});
+
+	return totp.validate({ token: totpCode, window: 1 }) === null ? 'invalid' : 'ok';
+}
+
+async function verifyGoogleCredential(credential: string, clientId: string): Promise<GoogleIdTokenPayload | null> {
+	try {
+		const { payload } = await jwtVerify<GoogleIdTokenPayload>(credential, GOOGLE_JWKS, {
+			audience: clientId,
+			issuer: ['accounts.google.com', 'https://accounts.google.com'],
+		});
+		return payload;
+	} catch (e) {
+		console.warn('Google ID token verification failed', e);
+		return null;
+	}
+}
+
 async function verifyTurnstile(token: string, ip: string, secretKey: string): Promise<boolean> {
 	const formData = new FormData();
 	formData.append('secret', secretKey);
@@ -104,7 +185,7 @@ async function verifyTurnstile(token: string, ip: string, secretKey: string): Pr
 }
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const method = request.method;
 
@@ -188,6 +269,7 @@ export default {
   reset_token_expires INTEGER,
   pending_email TEXT,
   email_change_token TEXT,
+  google_sub TEXT,
   avatar_url TEXT,
   nickname TEXT,
   email_notifications INTEGER DEFAULT 1,
@@ -255,6 +337,7 @@ export default {
   ip_address TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;`,
 				`INSERT OR IGNORE INTO settings (key, value) VALUES ('turnstile_enabled', '0');`,
 				`INSERT OR IGNORE INTO users (email, username, password, role, verified, nickname) VALUES 
 ('admin@adysec.com', 'Admin', 'e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7', 'admin', 1, 'System Admin');`
@@ -276,6 +359,21 @@ export default {
 
 		// perform initialization before security setup
 		await ensureSchema();
+
+		const ensureGoogleAuthSchema = async () => {
+			try {
+				const columns = await env.cforum_db.prepare('PRAGMA table_info(users)').all();
+				const hasGoogleSub = !!columns.results?.some((column: any) => column.name === 'google_sub');
+				if (!hasGoogleSub) {
+					await env.cforum_db.prepare('ALTER TABLE users ADD COLUMN google_sub TEXT').run();
+				}
+				await env.cforum_db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL').run();
+			} catch (e) {
+				console.error('Failed to ensure Google auth schema', e);
+			}
+		};
+
+		await ensureGoogleAuthSchema();
 
 		let security: Security;
 		try {
@@ -313,7 +411,7 @@ export default {
 
 
         const publicPaths = [
-            '/api/config', '/api/login', '/api/register', '/api/verify', 
+            '/api/config', '/api/login', '/api/register', '/api/verify', '/api/auth/google',
             '/api/auth/forgot-password', '/api/auth/reset-password', '/api/verify-email-change',
              // Static/Public GETs
             '/api/posts', '/api/categories', '/api/users' 
@@ -352,6 +450,8 @@ export default {
 				return jsonResponse({
 					turnstile_enabled: turnstileFullyConfigured,
 					turnstile_site_key: siteKey,
+					google_login_enabled: !!(env as any).GOOGLE_CLIENT_ID,
+					google_client_id: (env as any).GOOGLE_CLIENT_ID || '',
 					user_count: userCount || 0,
 					jwt_secret_configured: !!env.JWT_SECRET && String(env.JWT_SECRET).length >= 32,
 					email_provider: (env as any).RESEND_KEY ? 'resend' : ((env as any).SMTP_HOST ? 'smtp' : 'none'),
@@ -547,6 +647,121 @@ export default {
 					}
 				});
 			} catch (e) {
+				return handleError(e);
+			}
+		}
+
+		// POST /api/auth/google
+		if (url.pathname === '/api/auth/google' && method === 'POST') {
+			try {
+				const googleClientId = String((env as any).GOOGLE_CLIENT_ID || '').trim();
+				if (!googleClientId) {
+					return jsonResponse({ error: 'Google login is not configured' }, 503);
+				}
+
+				const body = await request.json() as any;
+				const { credential, totp_code } = body;
+				if (!credential || typeof credential !== 'string') {
+					return jsonResponse({ error: 'Missing Google credential' }, 400);
+				}
+
+				const googlePayload = await verifyGoogleCredential(credential, googleClientId);
+				if (typeof googlePayload?.sub !== 'string' || !googlePayload.sub || typeof googlePayload.email !== 'string' || !googlePayload.email) {
+					return jsonResponse({ error: 'Invalid Google credential' }, 401);
+				}
+				if (googlePayload.email_verified !== true) {
+					return jsonResponse({ error: 'Google email is not verified' }, 403);
+				}
+
+				const googleSub = googlePayload.sub;
+				const email = googlePayload.email.toLowerCase();
+				if (!email.endsWith('@gmail.com')) {
+					return jsonResponse({ error: 'Only Gmail accounts are allowed for Google login' }, 403);
+				}
+				if (email.length > 50) {
+					return jsonResponse({ error: 'Email too long (Max 50 chars)' }, 400);
+				}
+
+				let user = await env.cforum_db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(googleSub).first<DBUser>();
+				let action = 'LOGIN_GOOGLE';
+
+				if (!user) {
+					const existingUser = await env.cforum_db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').bind(email).first<DBUser>();
+					if (existingUser) {
+						if (!existingUser.verified) {
+							return jsonResponse({ error: 'Please verify your email first' }, 403);
+						}
+						if (existingUser.google_sub && existingUser.google_sub !== googleSub) {
+							return jsonResponse({ error: 'This email is already linked to another Google account' }, 409);
+						}
+
+						const totpStatus = await verifyTotpForUser(existingUser, totp_code);
+						if (totpStatus === 'required') return jsonResponse({ error: 'TOTP_REQUIRED' }, 403);
+						if (totpStatus === 'not_configured') return jsonResponse({ error: 'TOTP not configured' }, 500);
+						if (totpStatus === 'invalid') return jsonResponse({ error: 'Invalid TOTP code' }, 401);
+
+						await env.cforum_db.prepare('UPDATE users SET google_sub = ? WHERE id = ?').bind(googleSub, existingUser.id).run();
+						user = { ...existingUser, google_sub: googleSub };
+						action = 'LINK_GOOGLE_LOGIN';
+					} else {
+						const username = await makeUniqueGoogleUsername(env.cforum_db, googlePayload.name, email, googleSub);
+						const picture = typeof googlePayload.picture === 'string' && googlePayload.picture.length <= 500 && /^https:\/\//i.test(googlePayload.picture)
+							? googlePayload.picture
+							: null;
+						const passwordPlaceholder = `oauth:google:${crypto.randomUUID()}`;
+
+						const { success, meta } = await env.cforum_db.prepare(
+							'INSERT INTO users (email, username, password, role, verified, google_sub, avatar_url) VALUES (?, ?, ?, "user", 1, ?, ?)'
+						).bind(email, username, passwordPlaceholder, googleSub, picture).run();
+
+						if (!success) {
+							return jsonResponse({ error: 'Failed to create Google account' }, 500);
+						}
+
+						user = await env.cforum_db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(googleSub).first<DBUser>();
+						if (user && !picture) {
+							const identicon = await generateIdenticon(String(meta?.last_row_id || user.id));
+							await env.cforum_db.prepare('UPDATE users SET avatar_url = ? WHERE id = ?').bind(identicon, user.id).run();
+							user.avatar_url = identicon;
+						}
+						action = 'REGISTER_GOOGLE_LOGIN';
+					}
+				} else {
+					const totpStatus = await verifyTotpForUser(user, totp_code);
+					if (totpStatus === 'required') return jsonResponse({ error: 'TOTP_REQUIRED' }, 403);
+					if (totpStatus === 'not_configured') return jsonResponse({ error: 'TOTP not configured' }, 500);
+					if (totpStatus === 'invalid') return jsonResponse({ error: 'Invalid TOTP code' }, 401);
+				}
+
+				if (!user) {
+					return jsonResponse({ error: 'Failed to load Google account' }, 500);
+				}
+
+				const { token, jti, expiresAt } = await security.generateToken({
+					id: user.id,
+					role: user.role || 'user',
+					email: user.email
+				});
+
+				await env.cforum_db.prepare('INSERT INTO sessions (jti, user_id, expires_at) VALUES (?, ?, ?)').bind(jti, user.id, expiresAt).run();
+				await security.logAudit(user.id, action, 'user', String(user.id), { email: user.email, google_sub: googleSub }, request);
+
+				return jsonResponse({
+					token,
+					user: {
+						id: user.id,
+						email: user.email,
+						username: user.username,
+						avatar_url: user.avatar_url,
+						role: user.role || 'user',
+						totp_enabled: !!user.totp_enabled,
+						email_notifications: user.email_notifications === 1
+					}
+				});
+			} catch (e: any) {
+				if (e.message && e.message.includes('UNIQUE constraint failed')) {
+					return jsonResponse({ error: 'Google account is already linked' }, 409);
+				}
 				return handleError(e);
 			}
 		}

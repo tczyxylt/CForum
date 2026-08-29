@@ -1,5 +1,6 @@
 import * as React from 'react';
 
+import { GoogleSignInButton } from '@/components/google-sign-in-button';
 import { TurnstileWidget } from '@/components/turnstile';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,10 +19,22 @@ export function LoginPage() {
 	const [turnstileResetKey, setTurnstileResetKey] = React.useState(0);
 	const [loading, setLoading] = React.useState(false);
 	const [error, setError] = React.useState('');
+	const totpCodeRef = React.useRef('');
+
+	React.useEffect(() => {
+		totpCodeRef.current = totpCode;
+	}, [totpCode]);
 
 	const enabled = !!config?.turnstile_enabled;
 	const siteKey = config?.turnstile_site_key || '';
 	const turnstileActive = enabled && !!siteKey;
+	const googleLoginEnabled = !!config?.google_login_enabled && !!config.google_client_id;
+
+	const completeLogin = React.useCallback((data: any) => {
+		setUser(data.user);
+		setToken(data.token);
+		window.location.href = '/';
+	}, []);
 
 	async function handleSubmit(e: React.FormEvent) {
 		e.preventDefault();
@@ -53,15 +66,48 @@ export function LoginPage() {
 				throw new Error(data?.error || '登录失败');
 			}
 
-			setUser(data.user);
-			setToken(data.token);
-			window.location.href = '/';
+			completeLogin(data);
 		} catch (err: any) {
 			setError(String(err?.message || err));
 		} finally {
 			setLoading(false);
 		}
 	}
+
+	const handleGoogleCredential = React.useCallback(
+		async (credential: string) => {
+			setError('');
+			setLoading(true);
+			try {
+				const res = await fetch('/api/auth/google', {
+					method: 'POST',
+					headers: getSecurityHeaders('POST'),
+					body: JSON.stringify({
+						credential,
+						totp_code: totpCodeRef.current,
+					}),
+				});
+				const data = (await res.json()) as any;
+				if (!res.ok) {
+					if (data?.error === 'TOTP_REQUIRED') {
+						setError('请输入 2FA 验证码后再次点击 Google 登录');
+						return;
+					}
+					throw new Error(data?.error || 'Google 登录失败');
+				}
+				completeLogin(data);
+			} catch (err: any) {
+				setError(String(err?.message || err));
+			} finally {
+				setLoading(false);
+			}
+		},
+		[completeLogin]
+	);
+
+	const handleGoogleError = React.useCallback((message: string) => {
+		setError(message);
+	}, []);
 
 	return (
 		<div className="min-h-dvh bg-muted/20">
@@ -121,6 +167,23 @@ export function LoginPage() {
 							<Button className="w-full" type="submit" disabled={loading}>
 								{loading ? '处理中...' : '登录'}
 							</Button>
+
+							{googleLoginEnabled ? (
+								<>
+									<div className="flex items-center gap-3 text-xs text-muted-foreground">
+										<div className="h-px flex-1 bg-border" />
+										<span>或</span>
+										<div className="h-px flex-1 bg-border" />
+									</div>
+									<GoogleSignInButton
+										clientId={config.google_client_id || ''}
+										disabled={loading}
+										enabled={googleLoginEnabled}
+										onCredential={handleGoogleCredential}
+										onError={handleGoogleError}
+									/>
+								</>
+							) : null}
 
 							<div className="flex justify-between text-sm">
 								<a className="text-muted-foreground hover:underline" href="/register">

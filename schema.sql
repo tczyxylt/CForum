@@ -21,11 +21,14 @@ CREATE TABLE users (
   reset_token_expires INTEGER, -- Timestamp
   pending_email TEXT,
   email_change_token TEXT,
+  google_sub TEXT,
   avatar_url TEXT,
   nickname TEXT,
   email_notifications INTEGER DEFAULT 1,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;
 
 CREATE TABLE categories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

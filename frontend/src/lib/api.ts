@@ -3,6 +3,8 @@ import { getToken, logout } from '@/lib/auth';
 export type ForumConfig = {
 	turnstile_enabled: boolean;
 	turnstile_site_key: string;
+	google_login_enabled?: boolean;
+	google_client_id?: string;
 	user_count?: number;
 	jwt_secret_configured?: boolean; // indicates whether JWT_SECRET is set in backend
 };
